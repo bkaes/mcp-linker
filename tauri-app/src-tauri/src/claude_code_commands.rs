@@ -6,7 +6,13 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::command;
 
-// ~/.claude.json {projects: { "working_dir": "mcpServers": server}, other_keys: {}}
+/// Special identifier for global MCP config (applies to all projects)
+pub const GLOBAL_PROJECT_ID: &str = "Global";
+
+// ~/.claude.json structure:
+//   - Root "mcpServers": {} = user-scope servers (available everywhere)
+//   - "projects": { "/path": { "mcpServers": {} } } = local-scope servers (per-project)
+// Server format example:
 // {'sentry': {'type': 'http', 'url': 'https://mcp.sentry.dev/mcp'},
 //  'airtable': {'type': 'stdio', 'command': 'npx', 'args': ['-y', 'airtable-mcp-server'], 'env': {'AIRTABLE_API_KEY': 'YOUR_KEY'}}}
 
@@ -27,9 +33,12 @@ pub struct ClaudeCodeResponse {
 }
 
 /// List all MCP servers configured in Claude Code
+/// If working_dir is "Global", reads from ~/.claude.json root mcpServers (user-scope)
+/// Otherwise reads from ~/.claude.json projects[working_dir].mcpServers (local-scope)
 #[command]
 pub async fn claude_mcp_list(working_dir: String) -> Result<Vec<ClaudeCodeServer>, String> {
-    let claude_config_path = get_claude_config_path(Some(working_dir.clone()))?;
+    let mut servers = Vec::new();
+    let claude_config_path = get_claude_config_path(None)?;
 
     if !claude_config_path.exists() {
         return Ok(Vec::new());
@@ -41,15 +50,27 @@ pub async fn claude_mcp_list(working_dir: String) -> Result<Vec<ClaudeCodeServer
     let config: serde_json::Value = serde_json::from_str(&config_content)
         .map_err(|e| format!("Failed to parse Claude config: {}", e))?;
 
-    let mut servers = Vec::new();
-
-    if let Some(projects) = config.get("projects") {
-        if let Some(project_config) = projects.get(&working_dir) {
-            if let Some(mcp_servers) = project_config.get("mcpServers") {
-                if let Some(servers_obj) = mcp_servers.as_object() {
-                    for (name, server_config) in servers_obj {
-                        if let Ok(server) = parse_server_config(name, server_config) {
-                            servers.push(server);
+    if is_global_config(&working_dir) {
+        // Read from root-level mcpServers (user-scope config)
+        if let Some(mcp_servers) = config.get("mcpServers") {
+            if let Some(servers_obj) = mcp_servers.as_object() {
+                for (name, server_config) in servers_obj {
+                    if let Ok(server) = parse_server_config(name, server_config) {
+                        servers.push(server);
+                    }
+                }
+            }
+        }
+    } else {
+        // Read from per-project config (local-scope)
+        if let Some(projects) = config.get("projects") {
+            if let Some(project_config) = projects.get(&working_dir) {
+                if let Some(mcp_servers) = project_config.get("mcpServers") {
+                    if let Some(servers_obj) = mcp_servers.as_object() {
+                        for (name, server_config) in servers_obj {
+                            if let Ok(server) = parse_server_config(name, server_config) {
+                                servers.push(server);
+                            }
                         }
                     }
                 }
@@ -72,12 +93,15 @@ pub async fn claude_mcp_get(name: String, working_dir: String) -> Result<ClaudeC
 }
 
 /// Add a new MCP server to Claude Code
+/// If working_dir is "Global", writes to ~/.claude.json root mcpServers (user-scope)
+/// Otherwise writes to ~/.claude.json projects[working_dir].mcpServers (local-scope)
 #[command]
 pub async fn claude_mcp_add(
     request: ClaudeCodeServer,
     working_dir: String,
 ) -> Result<ClaudeCodeResponse, String> {
-    let claude_config_path = get_claude_config_path(Some(working_dir.clone()))?;
+    let server_json = server_to_json(&request)?;
+    let claude_config_path = get_claude_config_path(None)?;
 
     // Create backup if config file exists
     let backup_path = if claude_config_path.exists() {
@@ -93,34 +117,34 @@ pub async fn claude_mcp_add(
         serde_json::from_str(&config_content)
             .map_err(|e| format!("Failed to parse Claude config: {}", e))?
     } else {
-        serde_json::json!({"projects": {}})
+        serde_json::json!({})
     };
 
-    // Get or create the current working directory entry
-    let current_dir = working_dir;
-
-    if !config["projects"].is_object() {
-        config["projects"] = serde_json::json!({});
+    if is_global_config(&working_dir) {
+        // Write to root-level mcpServers (user-scope)
+        if !config["mcpServers"].is_object() {
+            config["mcpServers"] = serde_json::json!({});
+        }
+        config["mcpServers"][&request.name] = server_json;
+    } else {
+        // Write to per-project config (local-scope)
+        if !config["projects"].is_object() {
+            config["projects"] = serde_json::json!({});
+        }
+        if !config["projects"][&working_dir].is_object() {
+            config["projects"][&working_dir] = serde_json::json!({"mcpServers": {}});
+        }
+        if !config["projects"][&working_dir]["mcpServers"].is_object() {
+            config["projects"][&working_dir]["mcpServers"] = serde_json::json!({});
+        }
+        config["projects"][&working_dir]["mcpServers"][&request.name] = server_json;
     }
-
-    if !config["projects"][&current_dir].is_object() {
-        config["projects"][&current_dir] = serde_json::json!({"mcpServers": {}});
-    }
-
-    if !config["projects"][&current_dir]["mcpServers"].is_object() {
-        config["projects"][&current_dir]["mcpServers"] = serde_json::json!({});
-    }
-
-    // Convert server to JSON format
-    let server_json = server_to_json(&request)?;
-    config["projects"][&current_dir]["mcpServers"][&request.name] = server_json;
 
     // Write back to file
     if let Err(e) = fs::write(
         &claude_config_path,
         serde_json::to_string_pretty(&config).unwrap(),
     ) {
-        // Restore backup if write fails
         if let Some(backup_path) = &backup_path {
             let _ = restore_backup(&claude_config_path, backup_path);
         }
@@ -132,19 +156,22 @@ pub async fn claude_mcp_add(
         let _ = fs::remove_file(backup_path);
     }
 
+    let scope = if is_global_config(&working_dir) { "user" } else { "project" };
     Ok(ClaudeCodeResponse {
         success: true,
-        message: format!("Server '{}' added successfully", request.name),
+        message: format!("Server '{}' added to {} config successfully", request.name, scope),
     })
 }
 
 /// Remove an MCP server from Claude Code
+/// If working_dir is "Global", removes from ~/.claude.json root mcpServers (user-scope)
+/// Otherwise removes from ~/.claude.json projects[working_dir].mcpServers (local-scope)
 #[command]
 pub async fn claude_mcp_remove(
     name: String,
     working_dir: String,
 ) -> Result<ClaudeCodeResponse, String> {
-    let claude_config_path = get_claude_config_path(Some(working_dir.clone()))?;
+    let claude_config_path = get_claude_config_path(None)?;
 
     if !claude_config_path.exists() {
         return Err("Claude config file not found".to_string());
@@ -159,14 +186,26 @@ pub async fn claude_mcp_remove(
     let mut config: serde_json::Value = serde_json::from_str(&config_content)
         .map_err(|e| format!("Failed to parse Claude config: {}", e))?;
 
-    // Check if server exists in the specified working directory
     let mut found = false;
-    if let Some(projects) = config.get_mut("projects") {
-        if let Some(project) = projects.get_mut(&working_dir) {
-            if let Some(mcp_servers) = project.get_mut("mcpServers") {
-                if let Some(servers_obj) = mcp_servers.as_object_mut() {
-                    if servers_obj.remove(&name).is_some() {
-                        found = true;
+
+    if is_global_config(&working_dir) {
+        // Remove from root-level mcpServers (user-scope)
+        if let Some(mcp_servers) = config.get_mut("mcpServers") {
+            if let Some(servers_obj) = mcp_servers.as_object_mut() {
+                if servers_obj.remove(&name).is_some() {
+                    found = true;
+                }
+            }
+        }
+    } else {
+        // Remove from per-project config (local-scope)
+        if let Some(projects) = config.get_mut("projects") {
+            if let Some(project) = projects.get_mut(&working_dir) {
+                if let Some(mcp_servers) = project.get_mut("mcpServers") {
+                    if let Some(servers_obj) = mcp_servers.as_object_mut() {
+                        if servers_obj.remove(&name).is_some() {
+                            found = true;
+                        }
                     }
                 }
             }
@@ -179,32 +218,33 @@ pub async fn claude_mcp_remove(
             &claude_config_path,
             serde_json::to_string_pretty(&config).unwrap(),
         ) {
-            // Restore backup if write fails
             let _ = restore_backup(&claude_config_path, &backup_path);
             return Err(format!("Failed to write Claude config: {}", e));
         }
 
-        // Clean up backup file on success
         let _ = fs::remove_file(backup_path);
 
+        let scope = if is_global_config(&working_dir) { "user" } else { "project" };
         Ok(ClaudeCodeResponse {
             success: true,
-            message: format!("Server '{}' removed successfully", name),
+            message: format!("Server '{}' removed from {} config successfully", name, scope),
         })
     } else {
-        // Clean up backup file if server not found
         let _ = fs::remove_file(backup_path);
-        Err(format!("Server '{}' not found", name))
+        let scope = if is_global_config(&working_dir) { "user" } else { "project" };
+        Err(format!("Server '{}' not found in {} config", name, scope))
     }
 }
 
 /// List all projects configured in Claude Code
+/// Returns "Global" first (if user-scope mcpServers exists), followed by sorted project paths
 #[command]
 pub async fn claude_list_projects() -> Result<Vec<String>, String> {
+    let mut projects = Vec::new();
     let claude_config_path = get_claude_config_path(None)?;
 
     if !claude_config_path.exists() {
-        return Ok(Vec::new());
+        return Ok(projects);
     }
 
     let config_content = fs::read_to_string(&claude_config_path)
@@ -213,17 +253,25 @@ pub async fn claude_list_projects() -> Result<Vec<String>, String> {
     let config: serde_json::Value = serde_json::from_str(&config_content)
         .map_err(|e| format!("Failed to parse Claude config: {}", e))?;
 
-    let mut projects = Vec::new();
-
-    if let Some(projects_obj) = config.get("projects") {
-        if let Some(projects_map) = projects_obj.as_object() {
-            for project_name in projects_map.keys() {
-                projects.push(project_name.clone());
-            }
+    // Check if root-level mcpServers exists (user-scope) and add "Global" first
+    if let Some(mcp_servers) = config.get("mcpServers") {
+        if mcp_servers.is_object() {
+            projects.push(GLOBAL_PROJECT_ID.to_string());
         }
     }
 
-    projects.sort();
+    // Then add per-project configs (local-scope)
+    let mut project_paths = Vec::new();
+    if let Some(projects_obj) = config.get("projects") {
+        if let Some(projects_map) = projects_obj.as_object() {
+            for project_name in projects_map.keys() {
+                project_paths.push(project_name.clone());
+            }
+        }
+    }
+    project_paths.sort();
+    projects.extend(project_paths);
+
     Ok(projects)
 }
 
@@ -240,14 +288,77 @@ pub async fn check_claude_cli_available() -> Result<bool, String> {
 
 #[tauri::command]
 pub fn check_claude_config_exists() -> Result<bool, String> {
+    // Check native path first
     let home_dir = dirs::home_dir().ok_or("Unable to find home directory")?;
     let path = home_dir.join(".claude.json");
-    Ok(Path::new(&path).exists())
+    if path.exists() {
+        return Ok(true);
+    }
+
+    // On Windows, also check WSL paths
+    #[cfg(target_os = "windows")]
+    {
+        if find_wsl_claude_config(".claude.json").is_some() {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn get_claude_config_path(_working_dir: Option<String>) -> Result<PathBuf, String> {
+    // First try Windows native path
     let home_dir = dirs::home_dir().ok_or("Unable to find home directory")?;
-    Ok(home_dir.join(".claude.json"))
+    let native_path = home_dir.join(".claude.json");
+
+    if native_path.exists() {
+        return Ok(native_path);
+    }
+
+    // On Windows, also check WSL paths if native doesn't exist
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(wsl_path) = find_wsl_claude_config(".claude.json") {
+            return Ok(wsl_path);
+        }
+    }
+
+    // Return native path even if it doesn't exist (for creation)
+    Ok(native_path)
+}
+
+/// On Windows, attempt to find Claude config in WSL
+#[cfg(target_os = "windows")]
+fn find_wsl_claude_config(filename: &str) -> Option<PathBuf> {
+    // Common WSL distro names to check
+    let distros = ["Ubuntu", "Ubuntu-22.04", "Ubuntu-24.04", "Ubuntu-20.04", "Debian", "kali-linux", "openSUSE-Leap-15.5"];
+
+    // Try to get WSL username by checking common paths
+    for distro in &distros {
+        let wsl_base = PathBuf::from(format!(r"\\wsl$\{}", distro));
+        if !wsl_base.exists() {
+            continue;
+        }
+
+        // Check /home/* directories for .claude.json
+        let home_dir = wsl_base.join("home");
+        if let Ok(entries) = fs::read_dir(&home_dir) {
+            for entry in entries.flatten() {
+                let user_home = entry.path();
+                let config_path = user_home.join(filename);
+                if config_path.exists() {
+                    return Some(config_path);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Check if a working_dir refers to the global config
+fn is_global_config(working_dir: &str) -> bool {
+    working_dir == GLOBAL_PROJECT_ID
 }
 
 fn parse_server_config(name: &str, config: &serde_json::Value) -> Result<ClaudeCodeServer, String> {
