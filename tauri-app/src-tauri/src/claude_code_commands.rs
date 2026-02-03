@@ -6,7 +6,11 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::command;
 
-/// Special identifier for global MCP config (applies to all projects)
+/// Special identifier for global MCP config on Windows native (applies to all projects)
+pub const GLOBAL_WINDOWS_ID: &str = "Global (Windows)";
+/// Special identifier for global MCP config on WSL (applies to all projects)
+pub const GLOBAL_WSL_ID: &str = "Global (WSL)";
+/// Legacy identifier - kept for backwards compatibility
 pub const GLOBAL_PROJECT_ID: &str = "Global";
 
 // ~/.claude.json structure:
@@ -38,7 +42,7 @@ pub struct ClaudeCodeResponse {
 #[command]
 pub async fn claude_mcp_list(working_dir: String) -> Result<Vec<ClaudeCodeServer>, String> {
     let mut servers = Vec::new();
-    let claude_config_path = get_claude_config_path(None)?;
+    let claude_config_path = get_claude_config_path(Some(working_dir.clone()))?;
 
     if !claude_config_path.exists() {
         return Ok(Vec::new());
@@ -100,8 +104,11 @@ pub async fn claude_mcp_add(
     request: ClaudeCodeServer,
     working_dir: String,
 ) -> Result<ClaudeCodeResponse, String> {
+    println!("[claude_mcp_add] called: name={}, type={}, working_dir={}", request.name, request.r#type, working_dir);
     let server_json = server_to_json(&request)?;
-    let claude_config_path = get_claude_config_path(None)?;
+    println!("[claude_mcp_add] server_json: {}", server_json);
+    let claude_config_path = get_claude_config_path(Some(working_dir.clone()))?;
+    println!("[claude_mcp_add] config_path: {:?}", claude_config_path);
 
     // Create backup if config file exists
     let backup_path = if claude_config_path.exists() {
@@ -141,15 +148,17 @@ pub async fn claude_mcp_add(
     }
 
     // Write back to file
-    if let Err(e) = fs::write(
-        &claude_config_path,
-        serde_json::to_string_pretty(&config).unwrap(),
-    ) {
+    println!("[claude_mcp_add] Writing config to {:?}", claude_config_path);
+    let config_str = serde_json::to_string_pretty(&config).unwrap();
+    println!("[claude_mcp_add] Config content length: {} bytes", config_str.len());
+    if let Err(e) = fs::write(&claude_config_path, &config_str) {
+        eprintln!("[claude_mcp_add] Failed to write config: {}", e);
         if let Some(backup_path) = &backup_path {
             let _ = restore_backup(&claude_config_path, backup_path);
         }
         return Err(format!("Failed to write Claude config: {}", e));
     }
+    println!("[claude_mcp_add] Config written successfully");
 
     // Clean up backup file on success
     if let Some(backup_path) = backup_path {
@@ -171,7 +180,7 @@ pub async fn claude_mcp_remove(
     name: String,
     working_dir: String,
 ) -> Result<ClaudeCodeResponse, String> {
-    let claude_config_path = get_claude_config_path(None)?;
+    let claude_config_path = get_claude_config_path(Some(working_dir.clone()))?;
 
     if !claude_config_path.exists() {
         return Err("Claude config file not found".to_string());
@@ -236,41 +245,79 @@ pub async fn claude_mcp_remove(
     }
 }
 
-/// List all projects configured in Claude Code
-/// Returns "Global" first (if user-scope mcpServers exists), followed by sorted project paths
-#[command]
-pub async fn claude_list_projects() -> Result<Vec<String>, String> {
-    let mut projects = Vec::new();
-    let claude_config_path = get_claude_config_path(None)?;
-
-    if !claude_config_path.exists() {
-        return Ok(projects);
+/// Helper to check if a config file has root-level mcpServers
+fn config_has_global_mcp_servers(config_path: &Path) -> bool {
+    if !config_path.exists() {
+        return false;
     }
-
-    let config_content = fs::read_to_string(&claude_config_path)
-        .map_err(|e| format!("Failed to read Claude config: {}", e))?;
-
-    let config: serde_json::Value = serde_json::from_str(&config_content)
-        .map_err(|e| format!("Failed to parse Claude config: {}", e))?;
-
-    // Check if root-level mcpServers exists (user-scope) and add "Global" first
-    if let Some(mcp_servers) = config.get("mcpServers") {
-        if mcp_servers.is_object() {
-            projects.push(GLOBAL_PROJECT_ID.to_string());
-        }
-    }
-
-    // Then add per-project configs (local-scope)
-    let mut project_paths = Vec::new();
-    if let Some(projects_obj) = config.get("projects") {
-        if let Some(projects_map) = projects_obj.as_object() {
-            for project_name in projects_map.keys() {
-                project_paths.push(project_name.clone());
+    if let Ok(content) = fs::read_to_string(config_path) {
+        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(mcp_servers) = config.get("mcpServers") {
+                return mcp_servers.is_object() && !mcp_servers.as_object().unwrap().is_empty();
             }
         }
     }
-    project_paths.sort();
-    projects.extend(project_paths);
+    false
+}
+
+/// Helper to get project paths from a config file
+fn get_projects_from_config(config_path: &Path) -> Vec<String> {
+    let mut project_paths = Vec::new();
+    if !config_path.exists() {
+        return project_paths;
+    }
+    if let Ok(content) = fs::read_to_string(config_path) {
+        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(projects_obj) = config.get("projects") {
+                if let Some(projects_map) = projects_obj.as_object() {
+                    for project_name in projects_map.keys() {
+                        project_paths.push(project_name.clone());
+                    }
+                }
+            }
+        }
+    }
+    project_paths
+}
+
+/// List all projects configured in Claude Code
+/// Returns global configs first (Windows and/or WSL), followed by sorted project paths
+#[command]
+pub async fn claude_list_projects() -> Result<Vec<String>, String> {
+    let mut projects = Vec::new();
+    let mut all_project_paths = std::collections::HashSet::new();
+
+    // Always show "Global (Windows)" - users can add servers even if file doesn't exist yet
+    if get_windows_config_path().is_ok() {
+        projects.push(GLOBAL_WINDOWS_ID.to_string());
+    }
+
+    // Check Windows native config for project paths
+    if let Ok(windows_path) = get_windows_config_path() {
+        if windows_path.exists() {
+            for p in get_projects_from_config(&windows_path) {
+                all_project_paths.insert(p);
+            }
+        }
+    }
+
+    // Check WSL config (Windows only) - show if config file exists
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(wsl_path) = get_wsl_config_path() {
+            // Add "Global (WSL)" since we found a WSL config
+            projects.push(GLOBAL_WSL_ID.to_string());
+            // Collect project paths (may overlap with Windows paths)
+            for p in get_projects_from_config(&wsl_path) {
+                all_project_paths.insert(p);
+            }
+        }
+    }
+
+    // Sort and add project paths
+    let mut sorted_paths: Vec<String> = all_project_paths.into_iter().collect();
+    sorted_paths.sort();
+    projects.extend(sorted_paths);
 
     Ok(projects)
 }
@@ -306,11 +353,69 @@ pub fn check_claude_config_exists() -> Result<bool, String> {
     Ok(false)
 }
 
-fn get_claude_config_path(_working_dir: Option<String>) -> Result<PathBuf, String> {
-    // First try Windows native path
+/// Get the native Windows config path
+fn get_windows_config_path() -> Result<PathBuf, String> {
     let home_dir = dirs::home_dir().ok_or("Unable to find home directory")?;
-    let native_path = home_dir.join(".claude.json");
+    Ok(home_dir.join(".claude.json"))
+}
 
+/// Get the WSL config path if it exists
+#[cfg(target_os = "windows")]
+fn get_wsl_config_path() -> Option<PathBuf> {
+    find_wsl_claude_config(".claude.json")
+}
+
+#[cfg(not(target_os = "windows"))]
+fn get_wsl_config_path() -> Option<PathBuf> {
+    None
+}
+
+/// Check if a path looks like a Linux/Unix path (starts with /)
+fn is_linux_path(path: &str) -> bool {
+    path.starts_with('/')
+}
+
+fn get_claude_config_path(working_dir: Option<String>) -> Result<PathBuf, String> {
+    let working_dir = working_dir.as_deref().unwrap_or("");
+
+    // If explicitly requesting Windows global, return Windows path
+    if is_windows_global(working_dir) {
+        return get_windows_config_path();
+    }
+
+    // If explicitly requesting WSL global, return WSL path
+    if is_wsl_global(working_dir) {
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(wsl_path) = get_wsl_config_path() {
+                return Ok(wsl_path);
+            }
+            return Err("WSL Claude config not found".to_string());
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            return Err("WSL is only available on Windows".to_string());
+        }
+    }
+
+    // For project paths, determine config based on path format
+    #[cfg(target_os = "windows")]
+    if !working_dir.is_empty() && !is_global_config(working_dir) {
+        // Linux-style paths (e.g., /home/user/project) -> WSL config
+        if is_linux_path(working_dir) {
+            if let Some(wsl_path) = get_wsl_config_path() {
+                return Ok(wsl_path);
+            }
+            // Fall through to Windows config if WSL not available
+        } else {
+            // Windows-style paths -> Windows config
+            return get_windows_config_path();
+        }
+    }
+
+    // For legacy "Global" or fallback, use existing logic:
+    // First try Windows native path
+    let native_path = get_windows_config_path()?;
     if native_path.exists() {
         return Ok(native_path);
     }
@@ -318,7 +423,7 @@ fn get_claude_config_path(_working_dir: Option<String>) -> Result<PathBuf, Strin
     // On Windows, also check WSL paths if native doesn't exist
     #[cfg(target_os = "windows")]
     {
-        if let Some(wsl_path) = find_wsl_claude_config(".claude.json") {
+        if let Some(wsl_path) = get_wsl_config_path() {
             return Ok(wsl_path);
         }
     }
@@ -356,9 +461,21 @@ fn find_wsl_claude_config(filename: &str) -> Option<PathBuf> {
     None
 }
 
-/// Check if a working_dir refers to the global config
+/// Check if a working_dir refers to any global config (Windows or WSL)
 fn is_global_config(working_dir: &str) -> bool {
     working_dir == GLOBAL_PROJECT_ID
+        || working_dir == GLOBAL_WINDOWS_ID
+        || working_dir == GLOBAL_WSL_ID
+}
+
+/// Check if a working_dir refers to the Windows global config
+fn is_windows_global(working_dir: &str) -> bool {
+    working_dir == GLOBAL_WINDOWS_ID
+}
+
+/// Check if a working_dir refers to the WSL global config
+fn is_wsl_global(working_dir: &str) -> bool {
+    working_dir == GLOBAL_WSL_ID
 }
 
 fn parse_server_config(name: &str, config: &serde_json::Value) -> Result<ClaudeCodeServer, String> {

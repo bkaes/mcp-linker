@@ -73,7 +73,9 @@ export function useMcpConfig(
       let data: any;
       if (selectedClient === "claude_code") {
         if (!selectedProject) {
-          throw new Error("Please select a Claude Code project");
+          // Project not yet selected, wait for user to select one
+          setIsLoading(false);
+          return;
         }
         const list = await executeMcpOperation(
           invoke<any[]>("claude_mcp_list", { workingDir: selectedProject }),
@@ -147,7 +149,7 @@ export function useMcpConfig(
     } finally {
       setIsLoading(false);
     }
-  }, [selectedClient, selectedPath, executeMcpOperation]);
+  }, [selectedClient, selectedPath, selectedProject, executeMcpOperation]);
 
   const updateConfig = useCallback(
     async (

@@ -5,7 +5,7 @@ import { useConfigFileStore } from "@/stores/configFileStore";
 import { useTeamStore } from "@/stores/team";
 import { invoke } from "@tauri-apps/api/core";
 import { readText } from "@tauri-apps/plugin-clipboard-manager";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useServerConfig } from "../hooks/useServerConfig";
 import { useServerTemplateSubmit } from "./useServerTemplateSubmit";
@@ -46,27 +46,101 @@ export function useServerTemplateLogic(
     JSON.stringify({ [serverName]: config }, null, 2),
   );
 
+  // Track whether the config change originated from the JSON tab
+  // so the useEffect doesn't overwrite what the user just typed.
+  const jsonTabEditRef = useRef(false);
+
   // State for multiple JSON blocks from GitHub README
   // Each item: { obj: any, path: string[] }
   const [githubJsonBlocks, setGithubJsonBlocks] = useState<
     { serverName: string; obj: any }[]
   >([]);
 
-  // Sync jsonText when config changes (e.g. tab switch, load from github)
+  // Sync jsonText when config changes from the form tab or GitHub import.
+  // Skip when the change came from the JSON tab (user is editing directly).
   useEffect(() => {
+    if (jsonTabEditRef.current) {
+      jsonTabEditRef.current = false;
+      return;
+    }
     setJsonText(JSON.stringify({ [serverName]: config }, null, 2));
-  }, [config]);
+  }, [config, serverName]);
 
-  // Parse and set config from JSON
+  // Recursively find the actual server config (object with "command" or "url")
+  // Returns the config and the best server name found along the way
+  const findServerConfig = (
+    obj: any,
+    parentKey?: string,
+    depth = 0,
+  ): { name: string; config: any } | null => {
+    if (!obj || typeof obj !== "object" || depth > 4) return null;
+
+    // Found it: this object has "command" or "url"
+    if ("command" in obj || "url" in obj) {
+      return { name: parentKey || "", config: obj };
+    }
+
+    // Check mcpServers wrapper first
+    if (obj.mcpServers && typeof obj.mcpServers === "object") {
+      const firstKey = Object.keys(obj.mcpServers)[0];
+      if (firstKey) {
+        const result = findServerConfig(obj.mcpServers[firstKey], firstKey, depth + 1);
+        if (result) return result;
+      }
+    }
+
+    // Recurse into child keys
+    for (const key of Object.keys(obj)) {
+      if (key === "mcpServers") continue; // already checked
+      const inner = obj[key];
+      if (inner && typeof inner === "object") {
+        const result = findServerConfig(inner, key, depth + 1);
+        if (result) {
+          if (!result.name) result.name = key;
+          return result;
+        }
+      }
+    }
+
+    return null;
+  };
+
+  // Parse JSON and extract the server config + name.
+  // Returns the found result or null.
+  const parseJsonText = (
+    text: string,
+  ): { name: string; config: any } | null => {
+    try {
+      const parsed = JSON.parse(text);
+      return findServerConfig(parsed) ?? null;
+    } catch {
+      return null;
+    }
+  };
+
+  // Parse and set config from any JSON format users might paste
   const commonParse = (parsed: any) => {
-    if (parsed.mcpServers) {
-      const firstServerKey = Object.keys(parsed.mcpServers)[0];
-      const firstServerConfig = parsed.mcpServers[firstServerKey];
-      setConfig(firstServerConfig);
-      setServerName(firstServerKey);
-      setEnvValues(firstServerConfig.env);
+    const found = findServerConfig(parsed);
+    if (found) {
+      if (found.name) setServerName(found.name);
+      applyParsedConfig(found.config);
     } else {
-      setConfig(parsed);
+      // Nothing recognizable found, set as-is and let submit validation catch it
+      applyParsedConfig(parsed);
+    }
+  };
+
+  // Apply a parsed server config object and sync related state
+  const applyParsedConfig = (serverConfig: any) => {
+    setConfig(serverConfig);
+    if (serverConfig.env) setEnvValues(serverConfig.env);
+    if (serverConfig.headers) setHeaderValues(serverConfig.headers);
+    if ("command" in serverConfig) {
+      setServerType("stdio");
+    } else if (serverConfig.type === "sse" || serverConfig.type === "http") {
+      setServerType(serverConfig.type);
+    } else if ("url" in serverConfig) {
+      setServerType("http");
     }
   };
 
@@ -77,6 +151,7 @@ export function useServerTemplateLogic(
       setJsonText(text);
       try {
         const parsed = JSON.parse(text);
+        jsonTabEditRef.current = true;
         commonParse(parsed);
         toast.success("Config pasted from clipboard");
       } catch {
@@ -92,7 +167,8 @@ export function useServerTemplateLogic(
   const handleJsonBlur = () => {
     try {
       const parsed = JSON.parse(jsonText);
-      setConfig(parsed);
+      jsonTabEditRef.current = true;
+      commonParse(parsed);
     } catch {
       toast.error("Invalid JSON format");
     }
@@ -100,7 +176,7 @@ export function useServerTemplateLogic(
 
   // Use the custom submit hook to get both handlers
   // selectedPath may be null, convert to undefined for the hook
-  const { handleSubmit } = useServerTemplateSubmit({
+  const { handleSubmit: rawHandleSubmit } = useServerTemplateSubmit({
     serverName,
     setIsDialogOpen,
     config,
@@ -109,19 +185,43 @@ export function useServerTemplateLogic(
     selectedPath: selectedPath || undefined,
   });
 
+  // Wrap handleSubmit to always parse the current jsonText first.
+  // This ensures that even if the user typed JSON and clicked submit
+  // without blurring, the latest JSON text is used — not stale state.
+  const handleSubmit = async () => {
+    const found = parseJsonText(jsonText);
+    if (found) {
+      // Pass the freshly-parsed config directly to the submit handler
+      // so it doesn't rely on React state that may be one render behind.
+      await rawHandleSubmit({
+        config: found.config,
+        serverName: found.name || serverName,
+      });
+    } else {
+      // jsonText isn't valid JSON (user might be on the form tab).
+      // Fall through to use the current React state.
+      await rawHandleSubmit();
+    }
+  };
+
   const handleSubmitTeamLocal = async () => {
     try {
+      // Also parse jsonText for team local submit
+      const found = parseJsonText(jsonText);
+      const effectiveConfig = found?.config ?? config;
+      const effectiveName = found?.name || serverName;
+
       const teamConfigPath = getTeamConfigPath(selectedTeamId);
       await invoke("add_mcp_server", {
         clientName: "custom",
         path: teamConfigPath,
-        serverName: serverName,
-        serverConfig: config,
+        serverName: effectiveName,
+        serverConfig: effectiveConfig,
       });
-      
+
       // Refresh team data automatically
       refreshServerList("custom", teamConfigPath);
-      
+
       toast.success(`add to Team Local ok`);
       setIsDialogOpen(false);
     } catch (e: any) {
